@@ -2,6 +2,9 @@ import os
 import random
 from typing import List
 import datetime
+import logging
+
+logger = logging.getLogger('airflow.task')
 
 import sqlalchemy
 from airflow import DAG
@@ -101,9 +104,12 @@ def create_tables(**kwargs) -> None:
     or by using ORM (based on the information in the provided query).
     """
 
-    con = get_engine().connect()
-    [con.execute(i) for i in [QUERY_JOB_TABLE_CREATION, QUERY_JOB_RESULT_TABLE_CREATION]]
-
+    with get_engine().begin() as con:    
+        con.execute(
+            QUERY_JOB_TABLE_CREATION + 
+            QUERY_JOB_RESULT_TABLE_CREATION
+            )
+ 
      
 def insert_recs(**kwargs) -> None:
     """Insert a new record into table 'dummy_job' and table
@@ -124,13 +130,30 @@ def insert_recs(**kwargs) -> None:
         - add other thing you think necessary.
     """
 
-    con = get_engine().connect()
-    res = con.execute(f"""INSERT INTO {JOB_TABLE_NAME} DEFAULT VALUES RETURNING id;""")   
-    id = res.fetchall()[0][0] 
-    con.execute(f"""INSERT INTO {JOB_RESULT_TABLE_NAME} (job_id) VALUES ({id});""")
+    UPDATE_JOB_AND_RESULT_TABLES = f"""
+    WITH ins_job_table as (
+        INSERT INTO {JOB_TABLE_NAME} 
+        DEFAULT VALUES 
+        RETURNING id
+    )
+    INSERT INTO {JOB_RESULT_TABLE_NAME} (job_id) 
+    SELECT
+        id
+    FROM
+        ins_job_table
+    RETURNING job_id
+    ;  
+    """
 
-    kwargs['ti'].xcom_push(key='id', value=id)
-    
+    with get_engine().begin() as con:    
+        res = con.execute(UPDATE_JOB_AND_RESULT_TABLES)
+        id = res.fetchall()[0][0]        
+
+    if 'ti' in kwargs:
+        kwargs['ti'].xcom_push(key='id', value=id) 
+    else:
+        raise KeyError('"ti" key is not available in kwargs!')
+
 
 def get_hit_count(
         num_str: str,
@@ -154,18 +177,25 @@ def get_hit_count(
           in the same run.
       - add other thing you think necessary.
     """
-    
+
     # Simulate a scenario that this task fails for unknown reasons
     if is_raise_error():
-        raise ValueError
-
-    cnt = 0
-    for i in range(RAND_DIGIT_AMOUNT):
-        cnt += 1 if str(get_rand_digit()) in NUM_STR else 0
-
-    kwargs['ti'].xcom_push(key='cnt', value=cnt)
+        logger.error('test the logger :-))')
+        raise ValueError('random error to test the pipeline')
+    
+    cnts = {}    
+    for i in range(rand_digit_amount):
+        rand_digit_str = str(get_rand_digit())        
+        if rand_digit_str in cnts:
+            cnts[rand_digit_str] += 1
+        else:
+            if rand_digit_str in num_str:
+                cnts[rand_digit_str] = 1
+     
+    cnt = sum(cnts.values())
+    kwargs['ti'].xcom_push(key='cnt', value=cnt)  
+    
  
-
 def branching(**kwargs) -> List[str]:
     """Returns the list of task IDs for the next tasks.
 
@@ -184,6 +214,7 @@ def branching(**kwargs) -> List[str]:
     """
 
     hit_count = kwargs['ti'].xcom_pull(key='cnt')
+    
     if hit_count > HIT_COUNT_THRESHOLD:
         return TASK_ID_ACTION_ON_GT_THRESHOLD
     else:
@@ -208,11 +239,22 @@ def action_on_gt_threshold(**kwargs) -> None:
             - set column 'is_gt_th' to be 'true'
         - add other thing you think necessary.
     """
-
+  
     id = kwargs['ti'].xcom_pull(key='id')
-    con = get_engine().connect()
-    con.execute(f"""UPDATE {JOB_TABLE_NAME} SET is_active = FALSE WHERE id={id};""")
-    con.execute(f"""UPDATE {JOB_RESULT_TABLE_NAME} SET is_successful = TRUE, is_gt_th = TRUE WHERE job_id = {id};""")   
+
+    UPDATE_JOB_AND_RESULT_TABLES = f"""    
+    UPDATE {JOB_TABLE_NAME} 
+    SET is_active = FALSE 
+    WHERE id={id}
+    ;
+    UPDATE {JOB_RESULT_TABLE_NAME} 
+    SET is_successful = TRUE, 
+    is_gt_th = TRUE 
+    WHERE job_id = {id}
+    ;
+    """
+    with get_engine().begin() as con:    
+        con.execute(UPDATE_JOB_AND_RESULT_TABLES)   
 
 
 def action_on_lte_threshold(**kwargs) -> None:
@@ -235,10 +277,21 @@ def action_on_lte_threshold(**kwargs) -> None:
     """
 
     id = kwargs['ti'].xcom_pull(key='id')
-    con = get_engine().connect()
-    con.execute(f"""UPDATE {JOB_TABLE_NAME} SET is_active = FALSE WHERE id={id};""")
-    con.execute(f"""UPDATE {JOB_RESULT_TABLE_NAME} SET is_successful = TRUE, is_gt_th = FALSE WHERE job_id = {id};""") 
 
+    UPDATE_JOB_AND_RESULT_TABLES = f"""
+    UPDATE {JOB_TABLE_NAME} 
+    SET is_active = FALSE 
+    WHERE id={id}
+    ;
+    UPDATE {JOB_RESULT_TABLE_NAME} 
+    SET is_successful = TRUE, 
+    is_gt_th = FALSE 
+    WHERE job_id = {id}
+    ;    
+    """
+    with get_engine().begin() as con:
+        con.execute(UPDATE_JOB_AND_RESULT_TABLES)
+ 
 
 def action_on_error(**kwargs) -> None:
     """Actions to be taken when an exception is raised.
@@ -259,9 +312,19 @@ def action_on_error(**kwargs) -> None:
     """
 
     id = kwargs['ti'].xcom_pull(key='id')
-    con = get_engine().connect()
-    con.execute(f"""UPDATE {JOB_TABLE_NAME} SET is_active = FALSE WHERE id={id};""")
-    con.execute(f"""UPDATE {JOB_RESULT_TABLE_NAME} SET is_successful = FALSE WHERE job_id = {id};""") 
+    
+    UPDATE_JOB_AND_RESULT_TABLES = f"""
+    UPDATE {JOB_TABLE_NAME} 
+    SET is_active = FALSE 
+    WHERE id={id}
+    ;
+    UPDATE {JOB_RESULT_TABLE_NAME} 
+    SET is_successful = FALSE 
+    WHERE job_id = {id}
+    ;
+    """    
+    with get_engine().begin() as con:  
+        con.execute(UPDATE_JOB_AND_RESULT_TABLES)
 
 
 # DAG creation ##########################################
